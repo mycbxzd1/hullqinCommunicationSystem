@@ -1,10 +1,12 @@
-version: '3'
 services:
   chatserver:
-    build: .
+    build:
+      context: .
     ports:
       - "8080:8080"
     volumes:
       - ./data:/root/data
       - ./logs:/root/logs
+    environment:
+      - JWT_SECRET=30fukC81DuJMOf4YP8irUYRs4MNIlTVePNoFIMm2bdRA03DW6W
     restart: always

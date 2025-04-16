@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,46 +11,52 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt" // 使用 golang-jwt/jwt 库
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
 
-// ChatMessage 定义聊天记录
+// ChatMessage 表示聊天消息，包含用户徽章字段（bandge）
 type ChatMessage struct {
-	Type      string    `json:"type"`      // 消息类型，目前固定为 "message"
-	Sender    string    `json:"sender"`    // 发送者用户名
-	Content   string    `json:"content"`   // 消息内容
-	Timestamp time.Time `json:"timestamp"` // 发送时间
+	Type      string    `json:"type"`                // 固定为 "message"
+	Sender    string    `json:"sender"`              // 发送者用户名
+	Content   string    `json:"content"`             // 消息内容
+	Timestamp time.Time `json:"timestamp"`           // 发送时间
+	Bandge    string    `json:"bandge,omitempty"`    // 用户徽章，若有
 }
 
-// User 定义在线用户
+// User 表示在线用户信息，增加 LastActive 记录上次发消息时间
 type User struct {
-	Username      string
-	UUID          string
-	Conn          *websocket.Conn
-	ActiveLogout  bool // 标记是否主动注销，默认为 false
+	Username     string
+	UUID         string
+	Conn         *websocket.Conn
+	ActiveLogout bool      // 主动注销标记
+	Badge        string    // JWT 中解析的徽章（字段名 bandge）
+	LastActive   time.Time // 最后一次发送消息时间
 }
 
-// Room 定义聊天室
+// Room 表示聊天室
 type Room struct {
 	RoomID  string
-	Users   map[string]*User // key 是用户的 UUID
-	History []ChatMessage    // 聊天记录列表
-	Mutex   sync.Mutex       // 保护当前房间数据的并发访问
+	Users   map[string]*User // key：UUID
+	History []ChatMessage    // 聊天记录集合
+	Mutex   sync.Mutex       // 保护并发
 }
 
-// 全局房间管理
 var (
 	rooms      = make(map[string]*Room)
 	roomsMutex sync.RWMutex
-	// 辅助映射 uuid 到对应房间ID，便于 WS 连接查找
+
 	uuidRoomMap = make(map[string]string)
 	uuidMutex   sync.RWMutex
-)
 
-// 用于日志写入的互斥锁
-var logMutex sync.Mutex
+	// 用于日志写入的互斥锁
+	logMutex sync.Mutex
+
+	// 全局 JWT 密钥
+	jwtSecret string
+)
 
 // WebSocket 升级器
 var upgrader = websocket.Upgrader{
@@ -58,25 +65,26 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// 请求结构体
+// joinRequest 用户加入房间请求参数，增加 extend 字段
 type joinRequest struct {
 	RoomID   string `json:"roomid"`
 	Username string `json:"username"`
+	Extend   string `json:"extend,omitempty"` // 可选：Base64 再编码的 JWT
 }
 
-// 返回的 WS 地址结构
+// joinResponse 返回 WebSocket 地址
 type joinResponse struct {
 	WSURL string `json:"ws_url"`
 }
 
-// logoutRequest 定义注销用户传入参数
+// logoutRequest 用户注销请求参数
 type logoutRequest struct {
 	RoomID   string `json:"roomid"`
 	Username string `json:"username"`
 	UUID     string `json:"uuid"`
 }
 
-// getOrCreateRoom 获取或创建一个房间
+// getOrCreateRoom 获取或创建房间
 func getOrCreateRoom(roomID string) *Room {
 	roomsMutex.Lock()
 	defer roomsMutex.Unlock()
@@ -92,7 +100,7 @@ func getOrCreateRoom(roomID string) *Room {
 	return room
 }
 
-// POST /api/getws 处理加入房间请求
+// POST /api/getws 接口：加入房间获取 WebSocket 连接地址，同时解析 extend 参数中的徽章信息
 func getWSHandler(w http.ResponseWriter, r *http.Request) {
 	var req joinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -104,10 +112,36 @@ func getWSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 生成唯一 UUID
+	// 生成用户唯一 UUID
 	id := uuid.New().String()
 
-	// 获取或新建房间，并注册用户（初始时 WebSocket 连接尚未建立，Conn 为 nil）
+	var badge string
+	// 如果传入 extend 参数，则尝试解析 JWT，获取 bandge 字段
+	if req.Extend != "" {
+		decoded, err := base64.StdEncoding.DecodeString(req.Extend)
+		if err != nil {
+			log.Printf("Base64 解码 extend 失败: %v", err)
+		} else {
+			token, err := jwt.Parse(string(decoded), func(token *jwt.Token) (interface{}, error) {
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method")
+				}
+				return []byte(jwtSecret), nil
+			})
+			if err != nil {
+				log.Printf("JWT 解析失败: %v", err)
+			} else if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+				if b, exists := claims["bandge"]; exists {
+					if bs, ok := b.(string); ok {
+						badge = bs
+					}
+				}
+			} else {
+				log.Printf("JWT 无效或错误的 Claims")
+			}
+		}
+	}
+
 	room := getOrCreateRoom(req.RoomID)
 	room.Mutex.Lock()
 	room.Users[id] = &User{
@@ -115,23 +149,21 @@ func getWSHandler(w http.ResponseWriter, r *http.Request) {
 		UUID:         id,
 		Conn:         nil,
 		ActiveLogout: false,
+		Badge:        badge,
+		LastActive:   time.Now(),
 	}
 	room.Mutex.Unlock()
 
-	// 在全局映射中记录 uuid 对应的房间
 	uuidMutex.Lock()
 	uuidRoomMap[id] = req.RoomID
 	uuidMutex.Unlock()
 
-	// 返回 WebSocket 连接地址，实际部署时可返回完整地址
-	resp := joinResponse{
-		WSURL: "/ws/" + id,
-	}
+	resp := joinResponse{WSURL: "/ws/" + id}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// wsHandler 处理 WebSocket 连接 /ws/{uuid}
+// wsHandler 处理 WebSocket 连接，添加心跳 Ping 以及更新 LastActive 时间
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	uuidParam := vars["uuid"]
@@ -140,7 +172,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 根据 uuid 查找对应房间
 	uuidMutex.RLock()
 	roomID, exists := uuidRoomMap[uuidParam]
 	uuidMutex.RUnlock()
@@ -157,7 +188,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取用户信息
 	room.Mutex.Lock()
 	user, exists := room.Users[uuidParam]
 	room.Mutex.Unlock()
@@ -166,7 +196,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 升级为 WebSocket 连接
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket 升级失败: %v", err)
@@ -175,18 +204,36 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	user.Conn = conn
 	log.Printf("用户 %s(%s) 加入房间 %s", user.Username, user.UUID, room.RoomID)
 
-	// 读取客户端消息
+	// 启动 Ping 机制，每 30 秒发送一次 ping
+	go func(c *websocket.Conn) {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			if err := c.WriteMessage(websocket.PingMessage, []byte("ping")); err != nil {
+				log.Printf("Ping 发送失败: %v", err)
+				return
+			}
+		}
+	}(conn)
+
+	// 读取消息循环
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			// 如果连接异常关闭（例如 1006），不视为主动注销，保留用户信息
 			if closeErr, ok := err.(*websocket.CloseError); ok {
-				log.Printf("WebSocket 关闭码：%d, 原因: %s", closeErr.Code, closeErr.Text)
+				log.Printf("WebSocket 关闭码: %d, 原因: %s", closeErr.Code, closeErr.Text)
 			} else {
 				log.Printf("读取 WebSocket 消息失败: %v", err)
 			}
-			break // 直接退出循环，不调用 removeUser
+			break
 		}
+
+		// 更新用户最后活跃时间
+		room.Mutex.Lock()
+		user.LastActive = time.Now()
+		room.Mutex.Unlock()
+
 		var msg map[string]string
 		if err := json.Unmarshal(message, &msg); err != nil {
 			log.Printf("解析消息失败: %v", err)
@@ -198,29 +245,29 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				Sender:    user.Username,
 				Content:   msg["content"],
 				Timestamp: time.Now(),
+				Bandge:    user.Badge,
 			}
-			// 保存聊天记录到房间内存中
+			// 保存消息到历史记录
 			room.Mutex.Lock()
 			room.History = append(room.History, chatMsg)
 			room.Mutex.Unlock()
 
-			// 广播消息到其他在线用户
+			// 广播消息（包括发送者自身）
 			broadcastMessage(room, chatMsg)
 
-			// 将消息记录到日志文件（按天分目录）
+			// 记录日志到文件
 			recordChatLog(chatMsg)
 		}
 	}
-	// 在此处关闭连接后，不调用 removeUser，只有主动调用 logout 时才删除用户记录
 	conn.Close()
 	if !user.ActiveLogout {
-		log.Printf("WebSocket 异常断开(自动断开) 用户 %s(%s)，保留用户状态", user.Username, user.UUID)
+		log.Printf("WebSocket 异常断开（自动断开）用户 %s(%s)，保留状态", user.Username, user.UUID)
 	} else {
 		log.Printf("用户 %s(%s)已主动注销，连接已断开", user.Username, user.UUID)
 	}
 }
 
-// 广播消息到房间内所有在线用户
+// broadcastMessage 将消息广播到房间内所有在线用户
 func broadcastMessage(room *Room, msg ChatMessage) {
 	room.Mutex.Lock()
 	defer room.Mutex.Unlock()
@@ -230,7 +277,6 @@ func broadcastMessage(room *Room, msg ChatMessage) {
 		return
 	}
 	for _, u := range room.Users {
-		// 如果用户连接未建立或已断开则跳过
 		if u.Conn != nil {
 			if err := u.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				log.Printf("向用户 %s 发送消息失败: %v", u.Username, err)
@@ -239,19 +285,17 @@ func broadcastMessage(room *Room, msg ChatMessage) {
 	}
 }
 
-// recordChatLog 将聊天消息写入日志文件，日志按照日期生成目录保存
+// recordChatLog 将消息记录写入日志文件，日志文件存放在 logs/YYYYMMDD/chat.log
 func recordChatLog(chatMsg ChatMessage) {
-	// 按消息日期生成目录（格式：YYYYMMDD）
 	dateStr := chatMsg.Timestamp.Format("20060102")
 	dailyLogDir := filepath.Join("logs", dateStr)
 	if err := os.MkdirAll(dailyLogDir, 0755); err != nil {
 		log.Printf("创建日志目录失败: %v", err)
 		return
 	}
-	// 拼接日志文件路径，文件名为 chat.log
 	logFilePath := filepath.Join(dailyLogDir, "chat.log")
-	// 格式化日志内容，例如： "2023-10-15 14:23:45 [Alice]: Hello World"
-	logEntry := fmt.Sprintf("%s [%s]: %s\n", chatMsg.Timestamp.Format("2006-01-02 15:04:05"), chatMsg.Sender, chatMsg.Content)
+	logEntry := fmt.Sprintf("%s [%s] (bandge: %s): %s\n", 
+		chatMsg.Timestamp.Format("2006-01-02 15:04:05"), chatMsg.Sender, chatMsg.Bandge, chatMsg.Content)
 	logMutex.Lock()
 	defer logMutex.Unlock()
 	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -265,7 +309,7 @@ func recordChatLog(chatMsg ChatMessage) {
 	}
 }
 
-// GET /api/history?roomid=[roomid] 处理获取历史消息
+// historyHandler GET 历史消息接口，返回包含 bandge 字段的消息列表
 func historyHandler(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("roomid")
 	if roomID == "" {
@@ -286,7 +330,7 @@ func historyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(room.History)
 }
 
-// POST /api/logout 处理用户主动注销请求
+// logoutHandler 主动注销接口，走正常注销流程
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	var req logoutRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -297,7 +341,6 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "参数缺失", http.StatusBadRequest)
 		return
 	}
-
 	roomsMutex.RLock()
 	room, exists := rooms[req.RoomID]
 	roomsMutex.RUnlock()
@@ -305,7 +348,6 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "房间不存在", http.StatusBadRequest)
 		return
 	}
-
 	room.Mutex.Lock()
 	user, exists := room.Users[req.UUID]
 	if !exists {
@@ -313,30 +355,24 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "用户不存在", http.StatusBadRequest)
 		return
 	}
-	// 标记为主动注销
 	user.ActiveLogout = true
-	// 使 uuid 立即失效（从全局映射中移除）
 	uuidMutex.Lock()
 	delete(uuidRoomMap, req.UUID)
 	uuidMutex.Unlock()
 	room.Mutex.Unlock()
 
-	// 如果 WebSocket 连接还在，则主动发送关闭帧断开连接
 	if user.Conn != nil {
 		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "主动注销")
 		user.Conn.WriteMessage(websocket.CloseMessage, closeMsg)
 		user.Conn.Close()
 	}
 
-	// 主动注销则调用 removeUser 删除用户记录
 	removeUser(req.UUID, req.RoomID)
-
-	// 返回注销成功
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "注销成功")
 }
 
-// removeUser 从指定房间中删除用户，并检查房间中是否所有用户都是主动注销后清空房间并归档
+// removeUser 删除用户记录，并在房间为空时归档历史数据
 func removeUser(uuidStr, roomID string) {
 	roomsMutex.RLock()
 	room, exists := rooms[roomID]
@@ -344,16 +380,13 @@ func removeUser(uuidStr, roomID string) {
 	if !exists {
 		return
 	}
-	
-	// 删除用户记录（主动注销的用户会被删除）
 	room.Mutex.Lock()
 	delete(room.Users, uuidStr)
 	userCount := len(room.Users)
 	room.Mutex.Unlock()
 
-	// 如果房间中所有用户均已注销（即房间为空），归档房间历史记录并清除房间
 	if userCount == 0 {
-		log.Printf("房间 %s 所有用户已主动注销，归档历史记录并清空数据", roomID)
+		log.Printf("房间 %s 所有用户已注销，归档历史记录并清空数据", roomID)
 		archiveRoom(room)
 		roomsMutex.Lock()
 		delete(rooms, roomID)
@@ -361,7 +394,49 @@ func removeUser(uuidStr, roomID string) {
 	}
 }
 
-// archiveRoom 将房间历史记录归档到 data 目录，文件名包含归档时间
+// autoLogoutInactiveUsers 每分钟检查一次，自动注销超过 1 小时未活跃的用户
+func autoLogoutInactiveUsers() {
+	ticker := time.NewTicker(1 * time.Minute)
+	for {
+		<-ticker.C
+		now := time.Now()
+		var emptyRooms []string
+		roomsMutex.RLock()
+		for _, room := range rooms {
+			room.Mutex.Lock()
+			for uuid, user := range room.Users {
+				if !user.ActiveLogout && now.Sub(user.LastActive) > time.Hour {
+					log.Printf("用户 %s(%s)超时自动注销", user.Username, user.UUID)
+					user.ActiveLogout = true
+					uuidMutex.Lock()
+					delete(uuidRoomMap, uuid)
+					uuidMutex.Unlock()
+					if user.Conn != nil {
+						closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "超时自动注销")
+						user.Conn.WriteMessage(websocket.CloseMessage, closeMsg)
+						user.Conn.Close()
+					}
+					delete(room.Users, uuid)
+				}
+			}
+			if len(room.Users) == 0 {
+				emptyRooms = append(emptyRooms, room.RoomID)
+			}
+			room.Mutex.Unlock()
+		}
+		roomsMutex.RUnlock()
+		// 删除空房间
+		if len(emptyRooms) > 0 {
+			roomsMutex.Lock()
+			for _, roomID := range emptyRooms {
+				delete(rooms, roomID)
+			}
+			roomsMutex.Unlock()
+		}
+	}
+}
+
+// archiveRoom 将房间历史记录以 JSON 格式归档到 data 目录中
 func archiveRoom(room *Room) {
 	dataDir := "data"
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -385,11 +460,24 @@ func archiveRoom(room *Room) {
 }
 
 func main() {
+	// 初始化 JWT 密钥：先从环境变量中读取，如果为空则自动生成并输出日志
+	jwtSecret = os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = uuid.New().String()
+		log.Printf("未检测到 JWT_SECRET，自动生成: %s", jwtSecret)
+	} else {
+		log.Printf("使用 JWT_SECRET: %s", jwtSecret)
+	}
+
+	// 启动自动注销检查
+	go autoLogoutInactiveUsers()
+
 	router := mux.NewRouter()
 	router.HandleFunc("/api/getws", getWSHandler).Methods("POST")
 	router.HandleFunc("/api/history", historyHandler).Methods("GET")
 	router.HandleFunc("/api/logout", logoutHandler).Methods("POST")
 	router.HandleFunc("/ws/{uuid}", wsHandler)
+
 	addr := ":8080"
 	log.Printf("服务器启动，监听 %s", addr)
 	log.Fatal(http.ListenAndServe(addr, router))
